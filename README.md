@@ -5,4 +5,4 @@
 3. Download and copy datasets into sa-boyl/data folder.
 4. `export DISENTANGLEMENT_LIB_DATA=/path/to/sa-boyl/data`
 5. `cd sa-boyl`
-6. python -m src.main --help
+6. `python -m src.main --help`
