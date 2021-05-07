@@ -11,7 +11,7 @@ class DlibDataset(Dataset):
         self.dataset = get_named_ground_truth_data(name)
         self.random_state = np.random.RandomState(seed)
         self.len = self.dataset.images.shape[0]
-        self.C = 1 if len(self.dataset.images.shape) == 3 else 3
+        self.C = 1 if name in ['dsprites_full', 'smallnorb'] else 3
 
     def __len__(self):
         return self.len

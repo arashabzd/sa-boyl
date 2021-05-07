@@ -18,8 +18,8 @@ class Generator(nn.Module):
         self.bn5 = nn.BatchNorm2d(32)
         self.conv4 = nn.ConvTranspose2d(32, out_channels, 4, 2, 1)
         
-        self.relu = nn.ReLU(inplace=True)
-        self.lrelu = nn.LeakyReLU(negative_slope=.2, inplace=True)
+        self.relu = nn.ReLU()
+        self.lrelu = nn.LeakyReLU(.2)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, c, z):

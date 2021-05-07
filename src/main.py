@@ -24,7 +24,6 @@ def train():
         args.dataset, 
         seed=args.seed
     )
-    logger.debug(f'{args.dataset} dataset loaded.')
 
     logger.debug(f'initializing dataloader...')
     dataloader = DataLoader(
@@ -34,154 +33,170 @@ def train():
         pin_memory=True if args.cuda else False,
         drop_last=True
     )
-    logger.debug(f'dataloader initialized.')
-    
     logger.debug(f'initializing and loading networks to {device}...')
-    discriminator = Discriminator(dataset.C).to(device)
-    generator = Generator(args.c_dim, args.z_dim, dataset.C).to(device)
-    encoder = Encoder(dataset.C, args.c_dim).to(device)
-    projector = Projector(args.c_dim, args.c_dim*args.expansion).to(device)
-    predictor = Predictor(args.c_dim*args.expansion).to(device)
-    logger.debug(f'networks loaded.')
+    D = Discriminator(dataset.C).to(device)
+    G = Generator(args.c_dim, args.z_dim, dataset.C).to(device)
+    E = Encoder(dataset.C, args.c_dim).to(device)
+    Pc = Predictor(args.c_dim).to(device)
+    Pr = Predictor(args.c_dim).to(device)
     
     logger.debug(f'initializing optimizers...')
-    optim_d = optim.Adam(
-        discriminator.parameters(),
+    optim_D = optim.Adam(
+        D.parameters(),
         lr=2e-3,
         betas=(.5, .999)
     )
-    optim_g = optim.Adam(
-        [
-            {'params': generator.parameters(), 'lr': 1e-3, 'betas': (.5, .999), 'weight_decay': 0.0},
-            {'params': encoder.parameters(),   'lr': 2e-3, 'betas': (.5, .999), 'weight_decay': 1e-6},
-            {'params': projector.parameters(), 'lr': 2e-3, 'betas': (.5, .999), 'weight_decay': 1e-6},
-            {'params': predictor.parameters(), 'lr': 1e-2, 'betas': (.5, .999), 'weight_decay': 1e-6},
-        ]
+    optim_G = optim.Adam(
+        G.parameters(),
+        lr=1e-3,
+        betas=(.5, .999)
     )
-    logger.debug(f'optimizers initialized.')
+    optim_E = optim.Adam(
+        [
+            {'params': G.parameters(), 'lr': 1e-3},
+            {'params': E.parameters()},
+            {'params': Pc.parameters()},
+            {'params': Pr.parameters()},
+        ],
+        lr=2e-3,
+        betas=(.5, .999)
+    )
     
     one = torch.ones(args.batch_size, 1).to(device)
     zero = torch.zeros(args.batch_size, 1).to(device)
     
-    g = args.initial_gap
-    running_loss_d = 0.0
-    running_loss_g = 0.0
-    running_loss_e = 0.0
-    running_loss_i = 0.0
+    running_loss_D = 0.0
+    running_loss_G = 0.0
+    running_loss_E = 0.0
+    running_loss_Pc = 0.0
+    running_loss_Pr = 0.0
 
     for epoch in range(args.epochs):
-        discriminator.train()
-        generator.train()
-        encoder.train()
-        projector.train()
-        predictor.train()
-        
-        g -= args.gap_reduction
-        if g < 0:
-            g = 0
+        D.train()
+        G.train()
+        E.train()
+        Pc.train()
+        Pr.train()
 
         for i, (x, y) in enumerate(dataloader):
             itr = epoch*len(dataloader) + i
             x = x.to(device)
-            c, _, _ = create_factors(args.batch_size, args.c_dim)
-            c = c.to(device)
+            
+            # discriminator
+            c = torch.empty(args.batch_size, args.c_dim).uniform_(-1, 1).to(device)
             z = torch.randn(args.batch_size, args.z_dim).to(device)
-            loss_d  = F.binary_cross_entropy_with_logits(discriminator(x), one)
-            loss_d += F.binary_cross_entropy_with_logits(discriminator(generator(c, z).detach()), zero)
-            running_loss_d += loss_d.item()
+            loss_D  = F.binary_cross_entropy_with_logits(D(x), one)
+            loss_D += F.binary_cross_entropy_with_logits(D(G(c, z).detach()), zero)
+            optim_D.zero_grad() 
+            loss_D.backward()
+            optim_D.step()
+            running_loss_D += loss_D.item()
             
-            optim_d.zero_grad() 
-            loss_d.backward()
-            optim_d.step()
+            # generator
+            c = torch.empty(args.batch_size, args.c_dim).uniform_(-1, 1).to(device)
+            z = torch.randn(args.batch_size, args.z_dim).to(device)
+            loss_G  = F.binary_cross_entropy_with_logits(D(G(c, z)), one)
+            optim_G.zero_grad()
+            loss_G.backward()
+            optim_G.step()
+            running_loss_G += loss_G.item()
             
-            c1, c2, mask = create_factors(args.batch_size, args.c_dim, g)
-            c1 = c1.to(device)
-            c2 = c2.to(device)
-            mask = mask.to(device)
-            z1 = torch.randn(args.batch_size, args.z_dim).to(device)
-            z2 = torch.randn(args.batch_size, args.z_dim).to(device)
-            x1 = generator(c1, z1)
-            x2 = generator(c2, z2)
-
+            # encoder
+            c = E(x).detach()
+            cc, mc = consistent_like(c)
+            cr, mr = restrictive_like(c)
+            z = torch.randn(args.batch_size, args.z_dim).to(device)
+            zc = torch.randn(args.batch_size, args.z_dim).to(device)
+            zr = torch.randn(args.batch_size, args.z_dim).to(device)
+            lc = mc.argmax(dim=1)
+            lr = mr.argmin(dim=1)
+            e = E(G(c, z))
+            ec = E(G(cc, zc))
+            er = E(G(cr, zr))
+            pc1 = Pc(e, cc)
+            pc2 = Pc(ec, c)
+            pr1 = Pr(e, cr)
+            pr2 = Pr(er, c)
             
-            loss_g  = F.binary_cross_entropy_with_logits(discriminator(x1), one) / 2
-            loss_g += F.binary_cross_entropy_with_logits(discriminator(x2), one) / 2
-            running_loss_g += loss_g.item()
+            loss_E = (F.mse_loss(e, c) + F.mse_loss(ec, cc) + F.mse_loss(er, cr)) / 3
+            loss_Pc = (F.cross_entropy(pc1, lc) + F.cross_entropy(pc2, lc)) / 2
+            loss_Pr = (F.cross_entropy(pr1, lr) + F.cross_entropy(pr2, lr)) / 2
+            loss_EP = args.beta * loss_E + args.alpha * (loss_Pc + loss_Pr)
+            optim_E.zero_grad()
+            loss_EP.backward()
+            optim_E.step()
+            running_loss_E += loss_E.item()
+            running_loss_Pc += loss_Pc.item()
+            running_loss_Pr += loss_Pr.item()
             
-            e1 = encoder(x1)
-            e2 = encoder(x2)
-            j1 = projector(e1)
-            j2 = projector(e2)
-            p1 = predictor(j1)
-            p2 = predictor(j2)
-            
-            loss_i  = F.mse_loss(e1, c1) / 2
-            loss_i += F.mse_loss(e2, c2) / 2
-            running_loss_i += loss_i
-            
-            mask2 = torch.repeat_interleave(mask, args.expansion, dim=1)
-            loss_e  = -F.cosine_similarity(mask2*p1, mask2*j2.detach()).mean() / 2
-            loss_e += -F.cosine_similarity(mask2*p2, mask2*j1.detach()).mean() / 2
-            running_loss_e += loss_e.item()
-            
-            total_loss = loss_g + args.alpha * loss_e + args.beta * loss_i
-            
-            optim_g.zero_grad()
-            total_loss.backward()
-            optim_g.step()
             
             if itr % args.log_interval == 0:
-                running_loss_d /= args.log_interval
-                running_loss_g /= args.log_interval
-                running_loss_e /= args.log_interval
-                running_loss_i /= args.log_interval
-                
-                logger.info(f'[{epoch}/{i}] ({itr}): loss_d = {running_loss_d}, loss_g = {running_loss_g}, loss_e = {running_loss_e}, loss_i = {loss_i}')
-                
-                writer.add_scalar('Loss/D', running_loss_d, itr)
-                writer.add_scalar('Loss/G', running_loss_g, itr)
-                writer.add_scalar('Loss/E', running_loss_e, itr)
-                writer.add_scalar('Loss/I', running_loss_i, itr)
-                
-                running_loss_d = 0.0
-                running_loss_g = 0.0
-                running_loss_e = 0.0
-                running_loss_i = 0.0
-                
-        c1, c2, mask = create_factors(4, args.c_dim, g)
-        c1 = c1.to(device)
-        c2 = c2.to(device)
-        z1 = torch.randn(4, args.c_dim).to(device)
-        z2 = torch.randn(4, args.c_dim).to(device)
+                if itr != 0:
+                    running_loss_D /= args.log_interval
+                    running_loss_G /= args.log_interval
+                    running_loss_E /= args.log_interval
+                    running_loss_Pc /= args.log_interval
+                    running_loss_Pr /= args.log_interval
 
-        generator.eval()
+                
+                logger.info(
+                    f'[{epoch}/{i}] ({itr}): '
+                    f'loss_D = {running_loss_D}, '
+                    f'loss_G = {running_loss_G}, '
+                    f'loss_E = {running_loss_E}, '
+                    f'loss_Pc = {running_loss_Pc}, '
+                    f'loss_Pr = {running_loss_Pr}'
+                )
+                
+                writer.add_scalar('Loss/D', running_loss_D, itr)
+                writer.add_scalar('Loss/G', running_loss_G, itr)
+                writer.add_scalar('Loss/E', running_loss_E, itr)
+                writer.add_scalar('Loss/Pc', running_loss_Pc, itr)                
+                writer.add_scalar('Loss/Pr', running_loss_Pr, itr)
+                writer.flush()
+                
+                running_loss_D = 0.0
+                running_loss_G = 0.0
+                running_loss_E = 0.0
+                running_loss_Pc = 0.0
+                running_loss_Pr = 0.0
+        
+        D.eval()
+        G.eval()
+        E.eval()
+        Pc.eval()
+        Pr.eval()
+        
+        c = torch.empty(8, args.c_dim).uniform_(-1, 1).to(device)
+        z = torch.randn(8, args.z_dim).to(device)
+        logger.info('logging samples...')
         with torch.no_grad():
-            x1 = generator(c1, z1)
-            x2 = generator(c2, z2)
-        writer.add_images('x1', x1, itr)
-        writer.add_images('x2', x1, itr)
+            writer.add_images('x', G(c, z), itr)
                 
         # evaluate
+        logger.info('evaluation...')
         res = compute_metrics(
             dataset.dataset, 
-            make_representor(encoder, device),
-            ['factor_vae_metric', 'dci'],
-            
+            representor(E, device),
+            ['factor_vae_metric']
         )
-        writer.add_scalar('Metrics/DCI', res['dci']['disentanglement'], itr)
+        logger.info(res)
         writer.add_scalar('Metrics/FactorVAE', res['factor_vae_metric']['eval_accuracy'], itr)
+        writer.flush()
         
         # save checkpoint
+        logger.info('saving checkpoint...')
         checkpoint = {
             'epoch': epoch,
-            'iteration': i,
-            'optim_d': optim_d.state_dict(),
-            'optim_g': optim_g.state_dict(),
-            'discriminator': discriminator.state_dict(),
-            'generator':generator.state_dict(),
-            'encoder': encoder.state_dict(),
-            'projector': projector.state_dict(),
-            'predictor': predictor.state_dict()
+            'i': i,
+            'optim_D': optim_D.state_dict(),
+            'optim_G': optim_G.state_dict(),
+            'optim_E': optim_E.state_dict(),
+            'D': D.state_dict(),
+            'G': G.state_dict(),
+            'E': E.state_dict(),
+            'Pc': Pc.state_dict(),
+            'Pr': Pr.state_dict(),
         }
         torch.save(checkpoint, str(checkpoints_dir/'checkpoint.pt'))
         
@@ -205,32 +220,23 @@ train_parser = subparsers.add_parser(
     help='Train a model.'
 )
 train_parser.add_argument('--batch-size',  
-                          type=int, default=64, 
-                          help='Batch size (default: 64).')
+                          type=int, default=256, 
+                          help='Batch size (default: 256).')
 train_parser.add_argument('--epochs',  
-                          type=int, default=20, 
-                          help='Number of epochs (default: 20).')
+                          type=int, default=150, 
+                          help='Number of epochs (default: 150).')
 train_parser.add_argument('--c-dim',  
-                          type=int, default=5, 
-                          help='Code dimmension (default: 5).')
-train_parser.add_argument('--z-dim',  
-                          type=int, default=5, 
-                          help='Noise dimmension (default: 5).')
-train_parser.add_argument('--expansion',  
-                          type=int, default=5, 
-                          help='Projection head expantion (default: 5).')
-train_parser.add_argument('--initial-gap',  
-                          type=float, default=2.0, 
-                          help='Initial contrastive gap (default: 2.0).')
-train_parser.add_argument('--gap-reduction',  
-                          type=float, default=.1, 
-                          help='Linear reduction of contrastive gap with each epoch (default: 0.1).')
+                          type=int, default=10, 
+                          help='Code dimmension (default: 10).')
+train_parser.add_argument('--z-dim',
+                          type=int, default=0, 
+                          help='Noise dimmension (default: 0).')
 train_parser.add_argument('--alpha',  
-                          type=float, default=1.0, 
-                          help='Alpha parameter (default: 0.1).')
+                          type=float, default=2.0, 
+                          help='Alpha parameter (default: 2.0).')
 train_parser.add_argument('--beta',  
                           type=float, default=1.0, 
-                          help='Beta parameter (default: 0.1).')
+                          help='Beta parameter (default: 1.0).')
 train_parser.add_argument('--log-interval', 
                           type=int, default=100,
                           help='Log interval (default: 100).')
@@ -253,7 +259,7 @@ if __name__ == '__main__':
     
     logger = logging.getLogger(args.experiment)
     fhandler = logging.FileHandler(filename=logs_dir/(args.func.__name__+'.logger'), mode='w')
-    formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
     fhandler.setFormatter(formatter)
     logger.addHandler(fhandler)
     logger.setLevel(logging.DEBUG)
@@ -261,8 +267,8 @@ if __name__ == '__main__':
     
     logger.debug(f'initializing SummaryWriter...')
     writer = SummaryWriter(
-        log_dir=str(logs_dir/'tensorboard'), 
-        filename_suffix=args.func.__name__)
+        log_dir=str(logs_dir/'tensorboard')
+    )
     
     logger.debug(f'setting random seed {args.seed}...')
     random.seed(args.seed)
@@ -274,7 +280,6 @@ if __name__ == '__main__':
     
     logger.debug(f'initializing device...')
     device = torch.device("cuda" if args.cuda else "cpu")
-    logger.debug(f'device {device} initialized.')
     
     
     args.func()
